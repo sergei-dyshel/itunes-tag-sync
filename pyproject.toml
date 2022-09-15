@@ -8,6 +8,9 @@ packages = [{include = "itunes_tag_sync"}]
 
 [tool.poetry.dependencies]
 python = "^3.10"
+pywin32 = "^304"
+typer = "^0.6.1"
+eyed3 = "^0.9.6"
 
 
 [build-system]

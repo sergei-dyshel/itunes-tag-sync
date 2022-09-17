@@ -1,33 +1,36 @@
-from enum import Enum
-from numbers import Integral
-from typing import Any
-import win32com.client
 import logging
-import typer
-import eyed3
-import eyed3.id3
-import click
-import tqdm
-import logging
-from tqdm.contrib.logging import logging_redirect_tqdm
+import logging.config
 from dataclasses import dataclass
+from typing import Any
+
+import click
+import colorlog
+import eyed3.id3
+import tqdm
+import win32com.client
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 WMP = b'Windows Media Player 9 Series'
 
-log = logging.getLogger()
+log = logging.getLogger(__name__)
+
 
 def rating_as_stars(rating):
     return '★' * rating + '☆' * (5 - rating)
 
-@Enum
+
 class SetRatingMode:
     TAG = "tag"
     ITUNES = "itunes"
+    AUTO = "auto"
+
+    ALL = [TAG, ITUNES, AUTO]
 
 
 class Song:
-    track: Any # itunes track
+    track: Any  # itunes track
     tag: eyed3.id3.Tag
+    tag_dirty = False
 
     def __init__(self, track):
         self.track = track
@@ -65,6 +68,7 @@ class Song:
         assert 1 <= rating <= 5
         popm_rating = [None, 1, 64, 128, 196, 255][rating]
         popm.set(WMP, popm_rating, 0)
+        self.tag_dirty = True
 
     def set_itunes_rating(self, rating: int):
         if self.itunes_rating() == rating:
@@ -75,11 +79,12 @@ class Song:
 
 @dataclass
 class Config:
-    dry: bool
-    all: bool
-    verbose: bool
+    dry: bool = False
+    all: bool = False
+    verbose: bool = False
 
-cfg = Config()
+
+cfg: Config = None
 
 tracks: list[Any] = None
 
@@ -95,63 +100,90 @@ def main(**kwargs):
     global cfg
     cfg = Config(**kwargs)
 
-    logging.basicConfig()
+    formatter = logging.Formatter("%(message)s")
+    handler = colorlog.StreamHandler()
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG if cfg.verbose else logging.INFO)
+
 
 @main.command()
 def update_from_tag():
-    '''Update iTunes song metadat from MP3 tag'''
+    """Update iTunes song metadat from MP3 tag"""
+
     def command(song: Song):
         if not cfg.dry:
             log.debug('Updating metadata from file tag')
             song.track.UpdateInfoFromFile()
+
     return command
 
 
 @main.command()
-@click.argument('mode', type=click.Choice(list(SetRatingMode)), help='TODO')
+@click.argument('mode', type=click.Choice(SetRatingMode.ALL), default=SetRatingMode.AUTO)
 def set_rating(mode: SetRatingMode):
-    '''Set rating based on iTunes metadata or MP3 tag'''
+    """Set rating based on iTunes metadata or MP3 tag"""
+
     def command(song: Song):
+        log.debug(f'Tag rating {song.tag_rating()}, iTunes rating {song.itunes_rating()}')
         match mode:
             case SetRatingMode.TAG:
                 song.set_itunes_rating(song.tag_rating())
             case SetRatingMode.ITUNES:
                 song.set_tag_rating(song.itunes_rating())
+            case SetRatingMode.AUTO:
+                tag_rating = song.tag_rating()
+                itunes_rating = song.itunes_rating()
+                if tag_rating != 0 and itunes_rating == 0:
+                    song.set_itunes_rating(tag_rating)
+                if tag_rating == 0 and itunes_rating != 0:
+                    song.set_itunes_rating(tag_rating)
+                if tag_rating != 0 and itunes_rating != 0 and tag_rating != itunes_rating:
+                    log.warn(f'different tag and itunes ratings: {tag_rating} vs {itunes_rating}')
+
     return command
 
 
-@main.callback()
-def process_commands(commands, **kwargs):
+def fix_eyed3_logs():
     from eyed3.mp3.headers import log
     log.setLevel(logging.ERROR)
 
+
+@main.result_callback()
+def process_commands(commands, **kwargs):
+    fix_eyed3_logs()
     itunes = win32com.client.Dispatch("iTunes.Application")
+    global tracks
     if cfg.all:
         tracks = itunes.LibraryPlaylist.Tracks
     else:
         tracks = itunes.SelectedTracks
+        if tracks is None:
+            raise Exception('iTunes not in songs view')
 
     count = tracks.Count
     print(f"Total {count} tracks selected")
     progress = tqdm.tqdm(iterable=range(1, tracks.Count + 1),
-        unit='tracks',
-        delay=1,
-    )
+                         unit='tracks',
+                         delay=1,
+                         bar_format='{bar:20}{r_bar}{l_bar}'
+                         )
 
-    with logging_redirect_tqdm():
+    with logging_redirect_tqdm(loggers=[log]):
         for i in progress:
             track = tracks.Item(i)
             label = f'{track.Artist} - {track.Name}'
-            progress.set_description(label)
-            log.handlers[0].setFormatter(logging.Formatter(f'{label}: %(message)s'))
+            progress.set_description(label, refresh=False)
+            log.handlers[0].setFormatter(colorlog.ColoredFormatter(f'%(log_color)s{label}: %(message)s'))
             if track.Kind == 1:  # FileTrack
                 try:
                     song = Song(track)
                     for cmd in commands:
                         cmd(song)
+                    if song.tag_dirty and not cfg.dry:
+                        song.tag.save()
                 except Exception as exc:
-                    log.exception(exc_info=exc)
-
+                    log.exception("", exc_info=exc)
 
 
 if __name__ == '__main__':

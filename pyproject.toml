@@ -2,15 +2,17 @@
 name = "itunes-tag-sync"
 version = "0.1.0"
 description = ""
-authors = ["Sergei Dyshel <qyron.private@gmail.com>"]
+authors = ["Sergei Dyshel <sergei@dyshel.com>"]
 readme = "README.md"
-packages = [{include = "itunes_tag_sync"}]
+# packages = [{include = "itunes_tag_sync"}]
 
 [tool.poetry.dependencies]
 python = "^3.10"
-pywin32 = "^304"
+pywin32 = {version="^304", platform="windows"}
 typer = "^0.6.1"
 eyed3 = "^0.9.6"
+click = "^8.1.3"
+tqdm = "^4.64.1"
 
 
 [build-system]

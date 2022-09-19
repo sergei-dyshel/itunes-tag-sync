@@ -7,6 +7,7 @@ import click
 import colorlog
 import eyed3.id3
 import tqdm
+import os.path
 import win32com.client
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -82,6 +83,7 @@ class Config:
     dry: bool = False
     all: bool = False
     verbose: bool = False
+    clean: bool = False
 
 
 cfg: Config = None
@@ -93,6 +95,7 @@ tracks: list[Any] = None
 @click.option('-a', '--all', is_flag=True, help='Process all tracks, not only selected ones')
 @click.option('-n', '--dry', is_flag=True, help='Do not do any actual changes, just print actions')
 @click.option('-v', '--verbose', is_flag=True, help='Verbose logging')
+@click.option('-c', '--clean', is_flag=True, help='Delete non-existent songs')
 def main(**kwargs):
     """
     TODO: add help for
@@ -112,9 +115,14 @@ def update_from_tag():
     """Update iTunes song metadat from MP3 tag"""
 
     def command(song: Song):
-        if not cfg.dry:
-            log.debug('Updating metadata from file tag')
-            song.track.UpdateInfoFromFile()
+        track = song.track
+        tag = song.tag
+        if tag.artist == track.Artist and tag.album == track.Album and tag.album_artist == track.AlbumArtist and tag.title == track.Name and tag.genre == track.Genre:
+            return
+        log.debug('Updating metadata from file tag')
+        if cfg.dry:
+            return
+        song.track.UpdateInfoFromFile()
 
     return command
 
@@ -176,6 +184,13 @@ def process_commands(commands, **kwargs):
             progress.set_description(label, refresh=False)
             log.handlers[0].setFormatter(colorlog.ColoredFormatter(f'%(log_color)s{label}: %(message)s'))
             if track.Kind == 1:  # FileTrack
+                if not os.path.isfile(track.Location):
+                    if cfg.clean:
+                        log.info('deleting non-existent file')
+                        track.Delete()
+                    else:
+                        log.warn('file does not exists')
+                    continue
                 try:
                     song = Song(track)
                     for cmd in commands:

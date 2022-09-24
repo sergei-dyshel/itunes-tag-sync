@@ -3,208 +3,213 @@ import logging
 import logging.config
 import os.path
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable, Protocol, Set
 
 import click
 import colorlog
 import eyed3.id3
+from eyed3.mp3.headers import log as eyed3_log
+
 import tqdm
 import win32com.client
 from tqdm.contrib.logging import logging_redirect_tqdm
+
+dry: bool
 
 WMP = b'Windows Media Player 9 Series'
 
 log = logging.getLogger(__name__)
 
-
 def rating_as_stars(rating):
     return '★' * rating + '☆' * (5 - rating)
 
 
-class SetRatingMode:
-    TAG = "tag"
-    ITUNES = "itunes"
-    AUTO = "auto"
+class Track(Protocol):
+    Name: str
+    Artist: str
+    Rating: int
+    Location: str
+    PlayedDate: datetime.datetime
 
-    ALL = [TAG, ITUNES, AUTO]
+Tag = eyed3.id3.Tag
 
+def get_tag_rating(tag: Tag) -> int:
+    popm = tag.popularities.get(WMP)
+    if popm is None:
+        return 0
+    rating = popm.rating
+    if rating <= 31:
+        return 1
+    if rating <= 95:
+        return 2
+    if rating <= 159:
+        return 3
+    if rating <= 221:
+        return 4
+    return 5
 
-class Song:
-    track: Any  # itunes track
-    tag: eyed3.id3.Tag
-    tag_dirty = False
+def set_tag_rating(tag: Tag, rating: int):
+    popm = tag.popularities
+    if rating == 0:
+        popm.remove(WMP)
+        return
+    assert 1 <= rating <= 5
+    popm_rating = [None, 1, 64, 128, 196, 255][rating]
+    popm.set(WMP, popm_rating, 0)
 
-    def __init__(self, track):
-        self.track = track
-        audio = eyed3.load(track.location)
-        self.tag = audio.tag
+def sync_rating(tag: Tag, track: Track) -> bool:
+    itunes_rating = track.Rating
+    assert itunes_rating % 20 == 0, f'Invalid iTunes rating {itunes_rating}'
+    itunes_rating //= 20
 
-    def itunes_rating(self) -> int:
-        rating = self.track.Rating
-        assert rating % 20 == 0, f'Invalid track rating {rating}'
-        return rating // 20
+    tag_rating = get_tag_rating(tag)
 
-    def tag_rating(self) -> int:
-        popm = self.tag.popularities.get(WMP)
-        if popm is None:
-            return 0
-        rating = popm.rating
-        if rating <= 31:
-            return 1
-        if rating <= 95:
-            return 2
-        if rating <= 159:
-            return 3
-        if rating <= 221:
-            return 4
-        return 5
-
-    def set_tag_rating(self, rating: int):
-        if self.tag_rating() == rating:
-            return
-        log.info(f'setting tag rating to {rating}')
-        popm = self.tag.popularities
-        if rating == 0:
-            popm.remove(WMP)
-            return
-        assert 1 <= rating <= 5
-        popm_rating = [None, 1, 64, 128, 196, 255][rating]
-        popm.set(WMP, popm_rating, 0)
-        self.tag_dirty = True
-
-    def set_itunes_rating(self, rating: int):
-        if self.itunes_rating() == rating:
-            return
-        log.info(f'setting iTunes rating to {rating}')
-        self.track.Rating = rating * 20
-
-
-@dataclass
-class Config:
-    dry: bool = False
-    all: bool = False
-    verbose: bool = False
-    clean: bool = False
-
-
-cfg: Config = None
-
-tracks: list[Any] = None
-
-
-@click.group(chain=True)
-@click.option('-a', '--all', is_flag=True, help='Process all tracks, not only selected ones')
-@click.option('-n', '--dry', is_flag=True, help='Do not do any actual changes, just print actions')
-@click.option('-v', '--verbose', is_flag=True, help='Verbose logging')
-@click.option('-c', '--clean', is_flag=True, help='Delete non-existent songs')
-def main(**kwargs):
-    """
-    TODO: add help for
-    """
-    global cfg
-    cfg = Config(**kwargs)
-
-    formatter = logging.Formatter("%(message)s")
-    handler = colorlog.StreamHandler()
-    handler.setFormatter(formatter)
-    log.addHandler(handler)
-    log.setLevel(logging.DEBUG if cfg.verbose else logging.INFO)
-
-
-@main.command()
-@click.option('-q', '--quick', is_flag=True, help='Optimize by pre-checking known fields')
-def update_from_tag(quick: bool):
-    """Update iTunes song metadat from MP3 tag"""
-
-    def command(song: Song):
-        track = song.track
-        tag = song.tag
+    if tag_rating != 0 and itunes_rating == 0:
+        log.info(f'updating iTunes rating to {itunes_rating} => {tag_rating}')
+        if not dry:
+            track.Rating = tag_rating * 20
+        return False
+    if tag_rating == 0 and itunes_rating != 0:
+        log.info(f'updating tag rating to {tag_rating} => {itunes_rating}')
+        if not dry:
+            set_tag_rating(tag, itunes_rating)
+        return not dry
+    if tag_rating != 0 and itunes_rating != 0 and tag_rating != itunes_rating:
         tag_date = datetime.datetime.fromtimestamp(os.path.getmtime(track.Location))
-        track_date = track.ModificationDate.replace(tzinfo=None)
+        track_date = track.PlayedDate.replace(tzinfo=None)
         delta = tag_date - track_date
-        if quick and delta.total_seconds() < 1:
-            return
-        (log.debug if not quick else log.info)('Updating metadata from file tag')
-        if cfg.dry:
-            return
-        song.track.UpdateInfoFromFile()
+        log.debug(f'file mtime is {tag_date}, track last played date is {track_date}')
+        if delta.total_seconds() < 1:
+            log.info(f'updating older tag rating {tag_rating} => {itunes_rating}')
+            if not dry:
+                set_tag_rating(tag, itunes_rating)
+            return not dry
+        else:
+            log.info(f'updating older iTunes rating {itunes_rating} => {tag_rating}')
+            if not dry:
+                track.Rating = tag_rating * 20
+            return False
+    return False
 
-    return command
+def sync_tag(track: Track):
+    try:
+        audio = eyed3.load(track.Location)
+        tag: eyed3.id3.Tag = audio.tag
+    except Exception as exc:
+        log.error(f'could not load file: {exc}')
+        return
 
+    dirty = sync_rating(tag, track)
+    if dirty and not dry:
+        tag.save()
 
-@main.command()
-@click.argument('mode', type=click.Choice(SetRatingMode.ALL), default=SetRatingMode.AUTO)
-def set_rating(mode: SetRatingMode):
-    """Set rating based on iTunes metadata or MP3 tag"""
-
-    def command(song: Song):
-        log.debug(f'Tag rating {song.tag_rating()}, iTunes rating {song.itunes_rating()}')
-        match mode:
-            case SetRatingMode.TAG:
-                song.set_itunes_rating(song.tag_rating())
-            case SetRatingMode.ITUNES:
-                song.set_tag_rating(song.itunes_rating())
-            case SetRatingMode.AUTO:
-                tag_rating = song.tag_rating()
-                itunes_rating = song.itunes_rating()
-                if tag_rating != 0 and itunes_rating == 0:
-                    song.set_itunes_rating(tag_rating)
-                if tag_rating == 0 and itunes_rating != 0:
-                    song.set_tag_rating(itunes_rating)
-                if tag_rating != 0 and itunes_rating != 0 and tag_rating != itunes_rating:
-                    log.warning(f'different tag and itunes ratings: {tag_rating} vs {itunes_rating}')
-
-    return command
-
-
-def fix_eyed3_logs():
-    from eyed3.mp3.headers import log
-    log.setLevel(logging.ERROR)
-    return log
-
-
-@main.result_callback()
-def process_commands(commands, **kwargs):
-    eyed3_log = fix_eyed3_logs()
-    itunes = win32com.client.Dispatch("iTunes.Application")
-    global tracks
-    if cfg.all:
-        tracks = itunes.LibraryPlaylist.Tracks
-    else:
-        tracks = itunes.SelectedTracks
-        if tracks is None:
-            raise Exception('iTunes not in songs view')
-
-    count = tracks.Count
-    print(f"Total {count} tracks selected")
+def tqdm_tracks(tracks: Iterable[Track]) -> Iterable[Track]:
     progress = tqdm.tqdm(iterable=range(1, tracks.Count + 1),
                          unit='tracks',
                          delay=1,
                          bar_format='{bar:20}{r_bar}{l_bar}'
                          )
+    for i in progress:
+        track: Track = tracks.Item(i)
+        if track.Kind != 1:
+            continue
+        label = f'{track.Artist} - {track.Name}'
+        progress.set_description(label, refresh=False)
 
-    with logging_redirect_tqdm(loggers=[log, eyed3_log]):
-        for i in progress:
-            track = tracks.Item(i)
+        yield track
+
+def tqdm_redirect_log():
+    return logging_redirect_tqdm(loggers=[log, eyed3_log])
+
+def scan_for_new_files(library):
+    log.info('Scanning track locations...')
+    locations: Set[str] = set()
+    with tqdm_redirect_log():
+        for track in tqdm_tracks(library.LibraryPlaylist.Tracks):
+            locations.add(track.Location)
+    dirs = sorted(os.path.dirname(loc) for loc in locations)
+    i = 0
+    while i < len(dirs) - 1:
+        if dirs[i + 1].startswith(dirs[i]):
+            del dirs[i + 1]
+        else:
+            i += 1
+
+    for directory in dirs:
+        log.info(f'Scanning "{directory}"')
+        if not dry:
+            library.AddFiles(directory)
+
+@click.command()
+@click.option('--sel', '--selected', is_flag=True, help='Process only selected tracks')
+@click.option('-n', '--dry', '_dry', is_flag=True, help='Do not do any actual changes, just print actions')
+@click.option('-v', '--verbose', is_flag=True, help='Verbose logging')
+@click.option('--clean', is_flag=True, help='Delete non-existent songs')
+@click.option('--update', is_flag=True, help='Force update iTunes metadata from file tag')
+@click.option('--sync', is_flag=True, help='Sync file tag with iTunes')
+@click.option('--scan', is_flag=True, help='Scan folders for new files')
+def main(selected: bool, _dry: bool, verbose: bool, clean: bool, update: bool, sync: bool, scan: bool):
+    """
+    TODO: add help for
+    """
+
+    global dry
+    dry = _dry
+
+    logging.basicConfig(format='%(module)s %(message)s')
+
+    formatter = logging.Formatter("%(message)s")
+    handler = colorlog.StreamHandler()
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    eyed3_log.setLevel(logging.ERROR)
+
+    itunes = win32com.client.Dispatch("iTunes.Application")
+    library = itunes.LibraryPlaylist
+    if selected:
+        tracks = library.Tracks
+        if tracks is None:
+            raise Exception('iTunes not in songs view')
+    else:
+        tracks = itunes.SelectedTracks
+        if tracks is None:
+            raise Exception('iTunes not in songs view or no track selected')
+
+
+    if scan:
+        if selected:
+            log.error('Scanning for new files is diabled with --selected')
+        else:
+            scan_for_new_files(library)
+
+    if not update and not sync and not clean:
+        return
+
+    with tqdm_redirect_log():
+        for track in tqdm_tracks(tracks):
             label = f'{track.Artist} - {track.Name}'
-            progress.set_description(label, refresh=False)
             log.handlers[0].setFormatter(colorlog.ColoredFormatter(f'%(log_color)s{label}: %(message)s'))
-            if track.Kind == 1:  # FileTrack
-                if not os.path.isfile(track.Location):
-                    if cfg.clean:
-                        log.info('deleting non-existent file')
+            if not os.path.isfile(track.Location):
+                if clean:
+                    log.info(f'deleting non-existent file {track.Location}')
+                    if not dry:
                         track.Delete()
-                    else:
-                        log.warning('file does not exists')
-                    continue
-                try:
-                    song = Song(track)
-                    for cmd in commands:
-                        cmd(song)
-                    if song.tag_dirty and not cfg.dry:
-                        song.tag.save()
-                except Exception as exc:
-                    log.exception("", exc_info=exc)
+                else:
+                    log.warning(f'file does not exists: {track.Location}')
+                continue
+
+            try:
+                if update and not dry:
+                    track.UpdateInfoFromFile()
+                if sync:
+                    sync_tag(track)
+            except Exception as exc:
+                log.exception("", exc_info=exc)
+
+
+
 
 
 if __name__ == '__main__':

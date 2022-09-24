@@ -1,5 +1,7 @@
+import datetime
 import logging
 import logging.config
+import os.path
 from dataclasses import dataclass
 from typing import Any
 
@@ -7,7 +9,6 @@ import click
 import colorlog
 import eyed3.id3
 import tqdm
-import os.path
 import win32com.client
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -111,15 +112,19 @@ def main(**kwargs):
 
 
 @main.command()
-def update_from_tag():
+@click.option('-q', '--quick', is_flag=True, help='Optimize by pre-checking known fields')
+def update_from_tag(quick: bool):
     """Update iTunes song metadat from MP3 tag"""
 
     def command(song: Song):
         track = song.track
         tag = song.tag
-        if tag.artist == track.Artist and tag.album == track.Album and tag.album_artist == track.AlbumArtist and tag.title == track.Name and tag.genre == track.Genre:
+        tag_date = datetime.datetime.fromtimestamp(os.path.getmtime(track.Location))
+        track_date = track.ModificationDate.replace(tzinfo=None)
+        delta = tag_date - track_date
+        if quick and delta.total_seconds() < 1:
             return
-        log.debug('Updating metadata from file tag')
+        (log.debug if not quick else log.info)('Updating metadata from file tag')
         if cfg.dry:
             return
         song.track.UpdateInfoFromFile()
@@ -145,9 +150,9 @@ def set_rating(mode: SetRatingMode):
                 if tag_rating != 0 and itunes_rating == 0:
                     song.set_itunes_rating(tag_rating)
                 if tag_rating == 0 and itunes_rating != 0:
-                    song.set_itunes_rating(tag_rating)
+                    song.set_tag_rating(itunes_rating)
                 if tag_rating != 0 and itunes_rating != 0 and tag_rating != itunes_rating:
-                    log.warn(f'different tag and itunes ratings: {tag_rating} vs {itunes_rating}')
+                    log.warning(f'different tag and itunes ratings: {tag_rating} vs {itunes_rating}')
 
     return command
 
@@ -155,11 +160,12 @@ def set_rating(mode: SetRatingMode):
 def fix_eyed3_logs():
     from eyed3.mp3.headers import log
     log.setLevel(logging.ERROR)
+    return log
 
 
 @main.result_callback()
 def process_commands(commands, **kwargs):
-    fix_eyed3_logs()
+    eyed3_log = fix_eyed3_logs()
     itunes = win32com.client.Dispatch("iTunes.Application")
     global tracks
     if cfg.all:
@@ -177,7 +183,7 @@ def process_commands(commands, **kwargs):
                          bar_format='{bar:20}{r_bar}{l_bar}'
                          )
 
-    with logging_redirect_tqdm(loggers=[log]):
+    with logging_redirect_tqdm(loggers=[log, eyed3_log]):
         for i in progress:
             track = tracks.Item(i)
             label = f'{track.Artist} - {track.Name}'
@@ -189,7 +195,7 @@ def process_commands(commands, **kwargs):
                         log.info('deleting non-existent file')
                         track.Delete()
                     else:
-                        log.warn('file does not exists')
+                        log.warning('file does not exists')
                     continue
                 try:
                     song = Song(track)

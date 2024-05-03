@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import datetime
 import logging
 import logging.config
 import os.path
-from typing import Iterable, Protocol, Set, TypeVar, Literal
+from typing import Iterable, Protocol, TypeVar, Literal, Optional
 
 import click
 import colorlog
@@ -32,6 +34,10 @@ def rating_as_stars(rating):
     return '★' * rating + '☆' * (5 - rating)
 
 
+class Object(Protocol):
+    Name: str
+
+
 class Track(Protocol):
     Name: str
     Artist: str
@@ -54,18 +60,42 @@ class Collection(Protocol[Item]):
     def Item(self, i: int) -> Item: ...
 
 
+class NamedCollection(Collection[Item]):
+    def ItemByName(self, name: str) -> Item: ...
+
+
+def iterate(coll: Collection[Item]) -> Iterable[Item]:
+    for i in range(1, coll.Count + 1):
+        yield coll.Item(i)
+
+
 TrackCollection = Collection[Track]
 
 
-class Library:
+class Playlist(Object):
+    Kind: int
     Tracks: TrackCollection
+
+
+class UserPlaylist(Playlist):
+    Smart: bool
+    Parent: Optional[UserPlaylist]
+
+
+class Library(Playlist):
 
     def AddFiles(self, paths: list[str]): ...
 
 
-class ITunes:
+class Source(Object):
+    Kind: int
+    Playlists: NamedCollection[Playlist]
+
+
+class ITunes(Protocol):
     LibraryPlaylist: Library
     SelectedTracks: TrackCollection
+    Sources: NamedCollection[Source]
 
 
 Tag = eyed3.id3.Tag
@@ -175,19 +205,11 @@ def tqdm_tracks(tracks: TrackCollection) -> Iterable[Track]:
         yield track
 
 
-def scan_for_new_files(library):
-    log.info('Scanning track locations...')
-    locations: Set[str] = set()
-    with tqdm_redirect_log():
-        for track in tqdm_tracks(library.Tracks):
-            locations.add(track.Location)
-    dirs = sorted(os.path.dirname(loc) for loc in locations)
-    i = 0
-    while i < len(dirs) - 1:
-        if dirs[i + 1].startswith(dirs[i]):
-            del dirs[i + 1]
-        else:
-            i += 1
+def get_all_playlists(itunes: ITunes):
+    sources = itunes.Sources
+    library_source = sources.ItemByName("Library")
+    for pls in iterate(library_source.Playlists):
+        log.info(f'{pls.Name} {pls.Kind}')
 
 
 @click.command()
@@ -221,6 +243,11 @@ def main(selected: bool, _dry: bool, verbose: bool, clean: bool, update: bool, s
 
     itunes: ITunes = win32com.client.Dispatch("iTunes.Application")
     library = itunes.LibraryPlaylist
+
+    sources = itunes.Sources
+    library_source = sources.ItemByName("Library")
+    for pls in iterate(library_source.Playlists):
+        log.info(f'{pls.Name} {pls.Kind}')
     if not selected:
         tracks = library.Tracks
         if tracks is None:
